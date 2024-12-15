@@ -1,0 +1,24 @@
+{
+    "name": "client-server-etl",
+    "version": "1.0.0",
+    "description": "Client Server ETL Project",
+    "main": "server.js",
+    "scripts": {
+        "init-db": "psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -f db.sql",
+        "server": "nodemon server.js",
+        "client": "nodemon client.js",
+        "data-processor": "nodemon data_processor.js",
+        "dev": "concurrently \"npm run server\" \"npm run data-processor\" \"npm run client\"",
+        "start": "concurrently \"node data_processor\" \"node client\" \"node server\""
+    },
+    "dependencies": {
+        "axios": "^1.7.9",
+        "express": "^4.21.2",
+        "jsonlines": "^0.1.1",
+        "pg": "^8.13.1"
+    },
+    "devDependencies": {
+        "concurrently": "^9.1.0",
+        "nodemon": "^3.0.1"
+    }
+}
