@@ -1,6 +1,8 @@
 # Data ETL Project (Client-Server)
 
-   __TLDR;__ test results show that 2M events (100.71MB) (used `generateEvents(400000)` from [below script](#1-generate-large-amount-of-events-to-trigger-the-etl-without-restarting-the-processes)) are processed in about 30 minutes (357 5-second-partitioned even logs)
+   **TLDR;** This project demonstrates a basic data ETL process (processing revenue update events) without specialized tools, highlighting potential challenges. 
+   
+   Test results show that 2M events (100.71MB) (`generateEvents(400000)` from [below script](#1-generate-large-amount-of-events-to-trigger-the-etl-without-restarting-the-processes)) are processed in about 40 minutes.
    
    Upon initial startup, the 3 processes (client/server/data processor) will only listen and not do anything. Once you follow instructions from __[Testing](#testing)__, the process flow described in the __[Sequence diagram](#sequence-diagram)__ will begin.
    
@@ -17,10 +19,7 @@
    
    npm start
    ```
-
-**Project Summary**
-
-This project implements a basic data ETL process _highlighting the challenges of building a reliable data pipeline without specialized tools like Kafka or AWS SNS/SQS etc_. It consists of three main components:
+**Project summary**
 
 * **Client (`client.js`):** _(Simulates a Kafka producer)_ 
 
@@ -28,23 +27,26 @@ This project implements a basic data ETL process _highlighting the challenges of
 
     * Watches `events.jsonl` file, and upon `change` event resends all events again. This is for ease of experimentation. Refer to [Testing the Project](#testing) for details on generating events and trigger the ETL
 
+    * Ensures events are sent in exact same order as in `events.jsonl`
+
 * **Server (`server.js`):** _(Simulates a Kafka broker)_
 
     * Exposes `/liveEvent` endpoint. Every event that `client.js` sends, the `server.js` will append to `server_events_${fiveSecondsWindowPartitionNumber}.jsonl` file _(Simulates a Kafka topic)_. 
     
-    * Exposes `userEvents/:userId` endpoint that returns recor for particular user from db's `users_revenue` table 
+    * Exposes `userEvents/:userId` endpoint that returns the corresponding to `userId` record from db's `users_revenue` table 
 
 * **Data Processor (`data_processor.js`):** _(Simulates Kafka consumer)_ 
 
     * Every 5 seconds it reads _all_ `server_events_*.jsonl` files _(poorly simulating Kafka consumer fetching from the Broker)_ and
-        * _(Taken approach a.)_ aggregates all revenue updates deltas per user
+        * _(Taken approach **a.**)_ aggregates all revenue updates deltas per user
         * updates database in transaction, per user
-    * Maintains `processor_offset.json` where it keeps track for the processing of every time-partitioned event log
+    * Maintains `processor_offset.json` where it keeps track for the processing of every time-partitioned server event log
+
 
 **Limitations**
 
-* There are retry mechanisms in place for sending the event to server, and also for updating the database, _however_, if maximum attempts are reached an event will just be left unprocessed
-* Every 5 seconds scanning for _all_ `server_events*.jsonl` degrades performance with time. A mechanism for marking a partition as done should be implemented.
+* No Message Acknowledgement: While retry mechanisms are in place for sending events to the server and updating the database, there is no acknowledgement mechanism to confirm successful processing. Consequently, if the maximum retry attempts are exhausted, events remain unprocessed. (In a system with acknowledgements, the broker would redeliver unprocessed messages.)
+* No Data Processor Coordination: This implementation does not simulate coordination between multiple data processors (e.g., using a tool like ZooKeeper). Therefore, only one data processor instance can operate concurrently. Scanning all server_events*.jsonl partitions every 5 seconds is inefficient and will degrade performance as the number of partitions increases. 
 
 ## Sequence diagram
 ```mermaid
@@ -166,12 +168,13 @@ function aggregateOffsets() {
 aggregateOffsets();
 
 ``` 
+
 - Get a rough idea of how long the etl process was running 
     - _NOTE_: does counts only the producing of events. Actual ETL end is when the `aggregateOffsets()` from [2.](#2-check-the-number-of-processed-events-while-etl-is-running) reaches the number of events you started the process with
 ```bash
 echo $(( $(find server_events* -type f | wc -l) * 5 / 60 )) minutes
 ```
-- useful for tracking memory and CPU usage (PIDs are printed as part of the process logs)
+- useful for tracking memory and CPU usage (you can take a particular process PID from the project logs)
 ```bash
 ps aux | grep node | awk '{print $2, $3 " %CPU", $6/1024 " MB"}'
 ```
