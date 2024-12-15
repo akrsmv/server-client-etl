@@ -117,7 +117,7 @@ If you have your project running, upon executing below function:
     - the `server.js` will __append__ each received event to `server_events.jsonl` file
     - the `data_processor.js` will detect changes and will process __only the newly appended events__ (as it keeps its offset in a separate file `processor_offset.txt`), updating users_revenue table in postgres
 
-Example usage: `generateEvents(200000)` Will produce `events.jsonl` with aprr
+Example usage: `generateEvents(200000)` Will produce `events.jsonl` with total size of 50.35MB
 
 ```js
 function generateEvents(numTimes = 1) {
