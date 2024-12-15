@@ -1,5 +1,5 @@
 const express = require('express');
-const fs = require('fs');
+const fs = require('fs/promises'); // Use fs/promises for async/await
 const { Pool } = require('pg');
 
 const app = express();
@@ -23,16 +23,16 @@ const authenticate = (req, res, next) => {
 
 app.use(express.json());
 
-app.post('/liveEvent', authenticate, (req, res) => {
+app.post('/liveEvent', authenticate, async (req, res) => {  // Make the handler async
   const event = req.body;
-  fs.appendFile('server_events.jsonl', JSON.stringify(event) + '\n', (error) => {
-    if (error) {
-      console.error('[server] Error writing to file:', error);
-      return res.status(500).send({ error });
-    }
+  try {
+    await fs.appendFile('server_events.jsonl', JSON.stringify(event) + '\n'); // Use await
     console.log('[server] Event received and saved', event);
     res.status(201).send({ message: 'Event received' });
-  });
+  } catch (error) {
+    console.error('[server] Error writing to file:', error);
+    res.status(500).send({ error });
+  }
 });
 
 app.get('/userEvents/:userId', async (req, res) => {

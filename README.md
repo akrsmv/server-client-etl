@@ -37,6 +37,7 @@ This project implements a basic data ETL process _highlighting the challenges of
     * Every 5 seconds it reads the `server_events.jsonl` file _(poorly simulating Kafka consumer fetching from the Broker)_ and
         * _(Taken approach a.)_ aggregates all revenue updates deltas per user
         * updates database in transaction, per user
+    * NOTE: Exponential backoff may reach 17 minutes (if at the 10th, last retry attempt)
 
 
 **Limitations**
