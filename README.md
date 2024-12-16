@@ -46,7 +46,7 @@
 **Limitations**
 
 * No Message Acknowledgement: While retry mechanisms are in place for sending events to the server and updating the database, there is no acknowledgement mechanism to confirm successful processing. Consequently, if the maximum retry attempts are exhausted, events remain unprocessed. (In a system with acknowledgements, the broker would redeliver unprocessed messages.)
-* No Data Processor Coordination: This implementation does not simulate coordination between multiple data processors (e.g., using a tool like ZooKeeper). Therefore, only one data processor instance can operate concurrently. Scanning all server_events*.jsonl partitions every 5 seconds is inefficient and will degrade performance as the number of partitions increases. 
+* No Data Processor Coordination: This implementation does not simulate coordination between multiple data processors (e.g., using a tool like ZooKeeper). Therefore, only one data processor instance can operate concurrently. Scanning all server_events*.jsonl partitions every 5 seconds is inefficient and will degrade performance as the number of partitions increases. TODO a mechanism to mark a partition as done can be implemented
 
 ## Sequence diagram
 ```mermaid
@@ -107,7 +107,7 @@ sequenceDiagram
     Server-->>Client: Response
     deactivate Server
 
-    Note right of Data Processor: Stores last processed line in processor_offset.txt
+    Note right of Data Processor: Stores offset by partition in processor_offset.json
 ```
 
 ## Testing

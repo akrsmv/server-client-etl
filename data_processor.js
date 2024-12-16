@@ -48,14 +48,14 @@ const processEvents = async (eventsFile) => {
     const offset = getOffset(eventsFile);
     let currentLine = 0;
     const revenueUpdates = {};
-
+    // TODO make offset a number of bytes, and use it for opening the read stram, as a start offset
     const readStream = fs.createReadStream(eventsFile, { encoding: 'utf8' });
     const jsonStream = jsonlines.parse();
 
     jsonStream.on('data', (event) => {
       currentLine++;
       if (currentLine <= offset) {
-        return; // Already processed
+        return; // Already processed, skip it. (See todo above)
       }
 
       const { userId, name: eventType, value: deltaRevenew } = event;
