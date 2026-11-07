@@ -1,24 +1,34 @@
 {
-    "name": "client-server-etl",
-    "version": "1.0.0",
-    "description": "Client Server ETL Project",
+    "name": "server-client-etl",
+    "version": "2.0.0",
+    "description": "Kafka-semantics ETL demo built from first principles: producer, broker log, consumer, exactly-once effect",
     "main": "server.js",
+    "engines": {
+        "node": ">=20.12"
+    },
     "scripts": {
-        "init-db": "psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -f db.sql",
-        "server": "nodemon server.js",
-        "client": "nodemon client.js",
-        "data-processor": "nodemon data_processor.js",
-        "dev": "concurrently \"npm run server\" \"npm run data-processor\" \"npm run client\"",
-        "start": "concurrently \"node data_processor\" \"node client\" \"node server\""
+        "init-db": "psql -f db.sql",
+        "reset-db": "psql -c \"DROP TABLE IF EXISTS applied_events, processor_offsets, users_revenue\" && psql -f db.sql",
+        "server": "node server.js",
+        "client": "node client.js",
+        "data-processor": "node data_processor.js",
+        "start": "concurrently \"node data_processor\" \"node client\" \"node server\"",
+        "dev": "concurrently \"nodemon server.js\" \"nodemon data_processor.js\" \"nodemon client.js\"",
+        "lint": "eslint .",
+        "test": "bash setpoint-evals/etl/run-all.sh",
+        "se": "bash setpoint-evals/etl/run-all.sh",
+        "se:baseline": "bash setpoint-evals/etl/run-all.sh --against-baseline"
     },
     "dependencies": {
         "axios": "^1.7.9",
         "express": "^4.21.2",
-        "jsonlines": "^0.1.1",
         "pg": "^8.13.1"
     },
     "devDependencies": {
+        "@eslint/js": "^9.17.0",
         "concurrently": "^9.1.0",
+        "eslint": "^9.17.0",
+        "globals": "^15.14.0",
         "nodemon": "^3.0.1"
     }
 }
