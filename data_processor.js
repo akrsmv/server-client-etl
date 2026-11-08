@@ -1,204 +1,201 @@
-const fs = require('fs');
-const fsPromises = require('fs/promises');
-const jsonlines = require('jsonlines');
-const { Pool } = require('pg');
+'use strict';
 
-const pool = new Pool({
-  user: 'postgres',
-  host: 'localhost',
-  database: 'postgres',
-  password: 'postgres',
-  port: 5432
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
+const readline = require('readline');
+const { Pool } = require('pg');
+const config = require('./config');
+const { validateEvent } = require('./lib/validate');
+
+const PID = process.pid;
+const PARTITION_FILE = /^server_events_.*\.jsonl$/;
+// Single-processor fence: only one consumer may run (see README limitations).
+const ADVISORY_LOCK_KEY = 727420;
+
+const pool = new Pool(config.pg);
+
+// An error on an idle pooled connection (e.g. Postgres restarted) is logged,
+// never fatal: active queries fail on their own and the next poll retries.
+pool.on('error', (err) => {
+  console.error(`[data_processor][${PID}] idle database connection error (continuing):`, err.message);
 });
 
-const offsetFile = 'processor_offset.json';
-const EVENT_ADD_REVENUE = 'add_revenue';
-const EVENT_SUBTRACT_REVENUE = 'subtract_revenue';
-const PID = process.pid;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * - Checks for files matching the pattern `server_events_*.jsonl`
- * - Keeps offsets per file in `processor_offset.json`
- * - Processes only newly appended events to each file
- */
-const start = async () => {
-  while (true) {
-    console.log(`[data_processor][${PID}] Checking for new events`);
-    await checkForChanges();
-    await new Promise(resolve => setTimeout(resolve, 5000));
+// Held for the process lifetime on a dedicated connection. A second processor
+// exits loudly instead of double-consuming.
+const acquireProcessorLock = async () => {
+  const client = await pool.connect();
+  const { rows } = await client.query('SELECT pg_try_advisory_lock($1) AS acquired', [ADVISORY_LOCK_KEY]);
+  if (!rows[0].acquired) {
+    client.release();
+    console.error(`[data_processor][${PID}] another processor holds the advisory lock; only one may run. Exiting.`);
+    process.exit(1);
   }
+  return client;
 };
 
-const checkForChanges = async () => {
+// Poison lines never block their partition: they are isolated here with
+// partition, byte offset and reason, and processing continues past them.
+const deadLetter = async (partition, byteOffset, line, reason) => {
+  const entry = JSON.stringify({ ts: new Date().toISOString(), partition, byteOffset, reason, line });
   try {
-    const files = await fsPromises.readdir('./');
-    const eventsFiles = files.filter(file => file.startsWith('server_events_') && file.endsWith('.jsonl'));
-
-    for (const eventsFile of eventsFiles) {
-      await processEvents(eventsFile);
-    }
-
+    await fsp.appendFile(path.join(config.logDir, config.deadLetterFile), entry + '\n');
+    console.log(`[data_processor][${PID}] dead-lettered ${partition}@${byteOffset}: ${reason}`);
   } catch (err) {
-    console.error(`[data_processor][${PID}] Error checking for changes:`, err.message);
+    console.error(`[data_processor][${PID}] could not write dead-letter entry:`, err.message);
   }
 };
 
-const processEvents = async (eventsFile) => {
+// Reads one partition from its committed byte offset, then — in ONE
+// transaction — dedups by event id, applies the revenue deltas, records the
+// applied ids and advances the offset. Crash anywhere in that unit and the
+// whole unit replays cleanly; commit and the unit is exactly-once.
+const processPartition = async (partition) => {
+  const filePath = path.join(config.logDir, partition);
+  let size;
   try {
-    const offset = getOffset(eventsFile);
-    let currentLine = 0;
-    const revenueUpdates = {};
-    // TODO make offset a number of bytes, and use it for opening the read stram, as a start offset
-    const readStream = fs.createReadStream(eventsFile, { encoding: 'utf8' });
-    const jsonStream = jsonlines.parse();
-
-    jsonStream.on('data', (event) => {
-      currentLine++;
-      if (currentLine <= offset) {
-        return; // Already processed, skip it. (See todo above)
-      }
-
-      const { userId, name: eventType, value: deltaRevenew } = event;
-
-      if (!revenueUpdates[userId]) {
-        revenueUpdates[userId] = { add: 0, subtract: 0 };
-      }
-
-      if (eventType === EVENT_ADD_REVENUE) {
-        revenueUpdates[userId].add += deltaRevenew;
-      } else if (eventType === EVENT_SUBTRACT_REVENUE) {
-        revenueUpdates[userId].subtract += deltaRevenew;
-      }
-    });
-
-    jsonStream.on('end', async () => {
-      await updateUsersRevenue(revenueUpdates);
-      saveOffset(eventsFile, currentLine);
-    });
-
-    jsonStream.on('error', (err) => {
-      console.error(`[data_processor][${PID}] Error parsing JSON:`, err.message);
-    });
-
-    readStream.on('error', (err) => {
-      console.error(`[data_processor][${PID}] Error reading file:`, err.message);
-      if (err.code === 'ENOENT') {
-        console.log(`[data_processor][${PID}] File ${eventsFile} not found. Waiting for file creation...`);
-        saveOffset(eventsFile, 0);
-      }
-    });
-
-    readStream.pipe(jsonStream);
-
+    size = (await fsp.stat(filePath)).size;
   } catch (err) {
-    console.error(`[data_processor][${PID}] Error in processEvents:`, err);
+    if (err.code === 'ENOENT') return; // vanished between listing and stat
+    throw err;
   }
-};
 
-const countLines = async (filePath) => {
-  let count = 0;
-  const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
+  const { rows } = await pool.query('SELECT byte_offset FROM processor_offsets WHERE partition = $1', [partition]);
+  const committedOffset = rows.length ? Number(rows[0].byte_offset) : 0;
+  if (size <= committedOffset) return;
 
-  return new Promise((resolve, reject) => {
-    stream.on('data', (chunk) => {
-      count += chunk.split('\n').length - 1;
-    });
-
-    stream.on('end', () => {
-      resolve(count);
-    });
-
-    stream.on('error', reject);
-  });
-};
-
-/**
- * Executes DB transaction for updating user revenue.
- * Retries with exponential backoff.
- *
- * @param {Function} operation - The asynchronous operation to retry.
- * @param {number} [maxRetries=10] - The maximum number of retry attempts.
- * @param {number} [baseRetryDelay=500] - The base delay in milliseconds for retries.
- * @returns {Promise<any>} - The result of the operation.
- */
-const updateUser = async (userId, revenueDelta, maxRetries = 10, baseRetryDelay = 500) => {
-  const executeWithRetry = async (attempt = 0) => {
-    if (attempt > maxRetries) {
-      throw new Error(`Operation failed after maximum retries`);
+  const events = [];
+  let byteOffset = committedOffset;
+  // Read only up to the stat-time snapshot: anything appended during our read
+  // belongs to the next cycle, and a half-written tail line is never parsed.
+  const stream = fs.createReadStream(filePath, { start: committedOffset, end: size - 1, encoding: 'utf8' });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  for await (const line of rl) {
+    const lineStart = byteOffset;
+    byteOffset += Buffer.byteLength(line, 'utf8') + 1; // + the '\n'
+    if (byteOffset > size) {
+      // Partial tail (a writer crashed mid-line): stop before it; it is
+      // re-read once the line completes.
+      byteOffset = lineStart;
+      break;
     }
-
-    const retryDelay = baseRetryDelay * Math.pow(2, attempt);
-
-    if (attempt > 0) {
-      console.log(`[data_processor][${PID}] Retrying operation after ${retryDelay}ms (attempt ${attempt + 1})`);
-      await new Promise(resolve => setTimeout(resolve, retryDelay));
-    }
-    const connection = await pool.connect();
+    let event;
     try {
-      await connection.query('BEGIN');
-      await connection.query(
-          'SELECT upsert_user_revenue($1, $2)',
-          [userId, revenueDelta]
+      event = JSON.parse(line);
+    } catch {
+      await deadLetter(partition, lineStart, line, 'invalid JSON');
+      continue;
+    }
+    const invalidReason = validateEvent(event);
+    if (invalidReason) {
+      await deadLetter(partition, lineStart, line, invalidReason);
+      continue;
+    }
+    events.push(event);
+  }
+
+  if (byteOffset === committedOffset) return; // nothing new (or only a partial tail)
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Within-batch dedup: the same id twice in the unread tail applies once.
+    const batchSeen = new Set();
+    const fresh = [];
+    for (const event of events) {
+      if (!batchSeen.has(event.id)) {
+        batchSeen.add(event.id);
+        fresh.push(event);
+      }
+    }
+
+    // Cross-run dedup: ids already applied (earlier batch, earlier
+    // incarnation, a client retry that actually landed) never apply twice.
+    let toApply = fresh;
+    if (fresh.length) {
+      const applied = await client.query(
+        'SELECT event_id FROM applied_events WHERE event_id = ANY($1)',
+        [fresh.map((e) => e.id)],
       );
-      return await connection.query('COMMIT');
-    } catch (error) {
-      await connection.query('ROLLBACK');
-      console.error(`[data_processor][${PID}] Error in operation (attempt ${attempt + 1}):`, error);
-      return executeWithRetry(attempt + 1);
-    } finally {
-      connection.release();
-    }
-  };
-
-  return executeWithRetry();
-};
-
-/**
- * Updates the revenue of users in the database based on the provided revenue updates.
- *
- * @param {Object} revenueUpdates - An object mapping user IDs to revenue changes.
- */
-const updateUsersRevenue = async (revenueUpdates) => {
-  try {
-    for (const userId in revenueUpdates) {
-      const { add, subtract } = revenueUpdates[userId];
-      const revenueDelta = add - subtract;
-
-      updateUser(userId, revenueDelta);
-
-      console.log(`[data_processor][${PID}] Updated ${userId}.`);
+      const appliedIds = new Set(applied.rows.map((r) => r.event_id));
+      toApply = fresh.filter((e) => !appliedIds.has(e.id));
     }
 
-    if (Object.keys(revenueUpdates).length > 0) {
-      console.log(`[data_processor][${PID}] Database updated successfully`);
+    const deltas = new Map();
+    for (const event of toApply) {
+      const sign = event.name === 'add_revenue' ? 1 : -1;
+      deltas.set(event.userId, (deltas.get(event.userId) || 0) + sign * event.value);
+    }
+    for (const [userId, delta] of deltas) {
+      // Atomic upsert — the 2024 UPDATE-then-INSERT function raced itself.
+      await client.query(
+        `INSERT INTO users_revenue (user_id, revenue) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET revenue = users_revenue.revenue + EXCLUDED.revenue`,
+        [userId, Math.round(delta * 10000) / 10000],
+      );
     }
 
-  } catch (error) {
-    console.error(`[data_processor][${PID}] Error updating database:`, error.message);
-    throw error;
-  }
-};
+    if (toApply.length) {
+      await client.query(
+        `INSERT INTO applied_events (event_id, partition)
+         SELECT unnest($1::text[]), $2 ON CONFLICT (event_id) DO NOTHING`,
+        [toApply.map((e) => e.id), partition],
+      );
+    }
 
+    await client.query(
+      `INSERT INTO processor_offsets (partition, byte_offset) VALUES ($1, $2)
+       ON CONFLICT (partition) DO UPDATE SET byte_offset = EXCLUDED.byte_offset, updated_at = now()`,
+      [partition, byteOffset],
+    );
 
-const getOffset = (eventsFile) => {
-  try {
-    const offsetData = JSON.parse(fs.readFileSync(offsetFile, 'utf8'));
-    return offsetData[eventsFile] || 0;
+    await client.query('COMMIT');
+    console.log(
+      `[data_processor][${PID}] ${partition}: applied ${toApply.length} event(s)` +
+      ` (${fresh.length - toApply.length} duplicate(s)), offset ${committedOffset} -> ${byteOffset}`,
+    );
   } catch (err) {
-    return 0;
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
 };
 
-const saveOffset = (eventsFile, offset) => {
-  try {
-    const offsetData = JSON.parse(fs.readFileSync(offsetFile, 'utf8'));
-    offsetData[eventsFile] = offset;
-    fs.writeFileSync(offsetFile, JSON.stringify(offsetData));
-  } catch (err) {
-    const offsetData = {};
-    offsetData[eventsFile] = offset;
-    fs.writeFileSync(offsetFile, JSON.stringify(offsetData));
+const cycle = async () => {
+  const entries = await fsp.readdir(config.logDir);
+  for (const name of entries.filter((n) => PARTITION_FILE.test(n)).sort()) {
+    await processPartition(name);
   }
 };
 
-start();
+let stopping = false;
+for (const signal of ['SIGTERM', 'SIGINT']) {
+  process.on(signal, () => {
+    stopping = true;
+  });
+}
+
+const main = async () => {
+  const lockClient = await acquireProcessorLock();
+  console.log(`[data_processor][${PID}] started; polling ${config.logDir} every ${config.pollIntervalMs}ms`);
+  while (!stopping) {
+    try {
+      await cycle();
+    } catch (err) {
+      console.error(`[data_processor][${PID}] cycle failed (will retry next poll):`, err.message);
+    }
+    if (!stopping) await sleep(config.pollIntervalMs);
+  }
+  lockClient.release(true);
+  await pool.end();
+  process.exit(0);
+};
+
+main().catch((err) => {
+  console.error(`[data_processor][${PID}] fatal:`, err);
+  process.exit(1);
+});

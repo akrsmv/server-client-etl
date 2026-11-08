@@ -1,128 +1,111 @@
-const fs = require('fs');
-const readline = require('readline');
-const axios = require('axios');
+'use strict';
 
-/**
- * The input file to read events from
- */
-const eventsFile = 'events.jsonl';
+const fs = require('fs');
+const fsp = require('fs/promises');
+const readline = require('readline');
+const crypto = require('crypto');
+const axios = require('axios');
+const config = require('./config');
+
 const PID = process.pid;
+const MAX_RETRY_ATTEMPTS = 10;
+const BASE_RETRY_DELAY_MS = 500;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Event identity = (input file inode, 1-based line number, raw line). Retries
+// and watch-triggered re-reads of the same file carry the same id and are
+// deduped downstream; regenerating the file (new inode) starts a fresh
+// identity space so a new experiment is never mistaken for a replay.
+const eventId = (ino, lineNumber, line) =>
+  crypto.createHash('sha256').update(`${ino}:${lineNumber}:${line}`).digest('hex').slice(0, 32);
 
 const sendEvent = async (event, retryAttempt = 0) => {
-  const MAX_RETRY_ATTEMPTS = 10;
-  const BASE_RETRY_DELAY = 500;
-
   if (retryAttempt > MAX_RETRY_ATTEMPTS) {
-    throw new Error(`[client][${PID}] Failed to send event after maximum retries`);
+    throw new Error(`[client][${PID}] Failed to send event after ${MAX_RETRY_ATTEMPTS} retries`);
   }
-
-  const retryDelay = BASE_RETRY_DELAY * Math.pow(2, retryAttempt);
-
   if (retryAttempt > 0) {
-    console.log(`[client][${PID}] Retrying event after ${retryDelay}ms (attempt ${retryAttempt + 1})`);
-    await new Promise(resolve => setTimeout(resolve, retryDelay));
+    const retryDelay = BASE_RETRY_DELAY_MS * Math.pow(2, retryAttempt);
+    console.log(`[client][${PID}] Retrying event ${event.id} after ${retryDelay}ms (attempt ${retryAttempt + 1})`);
+    await sleep(retryDelay);
   }
-
   try {
-    await axios.post('http://localhost:8000/liveEvent', event, {
-      headers: {
-        Authorization: 'secret',
-      },
+    await axios.post(`${config.serverUrl}/liveEvent`, event, {
+      headers: { Authorization: config.apiToken },
     });
-    console.log(`[client][${PID}] Event sent.`);
   } catch (error) {
-    console.error(`[client][${PID}] Error sending event (attempt ${retryAttempt + 1})`);
-    await sendEvent(event, retryAttempt + 1); // Recursive retry
+    console.error(`[client][${PID}] Error sending event ${event.id} (attempt ${retryAttempt + 1}): ${error.message}`);
+    await sendEvent(event, retryAttempt + 1);
   }
 };
 
 const processEventsLineByLine = async () => {
+  const stat = await fsp.stat(config.eventsFile).catch(() => null);
+  if (!stat) {
+    console.log(`[client][${PID}] File ${config.eventsFile} not found.`);
+    return;
+  }
+  const stream = fs.createReadStream(config.eventsFile);
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  let lineNumber = 0;
+  for await (const line of rl) {
+    lineNumber += 1;
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      console.error(`[client][${PID}] Skipping unparsable line ${lineNumber}`);
+      continue;
+    }
+    event.id = eventId(stat.ino, lineNumber, line);
+    try {
+      await sendEvent(event); // sequential: preserves file order, which is the demo's point
+    } catch (error) {
+      console.error(`[client][${PID}] Giving up on line ${lineNumber}: ${error.message}`);
+    }
+  }
+  console.log(`[client][${PID}] Sent ${lineNumber} line(s) from ${config.eventsFile}`);
+};
+
+// Watch-and-resend: on `change` the whole file is re-read and re-sent. With
+// server-side identity this is now harmless (duplicates dedupe) and stays
+// useful for experimenting.
+const watchFile = () => {
+  let debounce = null;
   try {
-    // Check if the file exists before attempting to read it
-    if (!fs.existsSync(eventsFile)) {
-      console.log(`[client][${PID}] File ${eventsFile} not found.`);
-      return;
-    }
-
-    const fileStream = fs.createReadStream(eventsFile);
-    const rl = readline.createInterface({
-      input: fileStream,
-      crlfDelay: Infinity
-    });
-
-    for await (const line of rl) {
-      try {
-        const event = JSON.parse(line);
-        await sendEvent(event);
-      } catch (error) {
-        console.error(`[client][${PID}] Error processing event:`, error.message);
+    fs.watch(config.eventsFile, (eventType, filename) => {
+      if (!filename) return;
+      if (eventType === 'rename') {
+        // rename also fires on delete: re-arm the whole loop
+        console.log(`[client][${PID}] ${config.eventsFile} renamed or deleted; re-arming`);
+        setTimeout(start, 1000);
+        return;
       }
-    }
+      if (debounce) return;
+      debounce = setTimeout(() => {
+        debounce = null;
+      }, 500);
+      console.log(`[client][${PID}] ${config.eventsFile} changed; re-sending (dedup makes this free)`);
+      processEventsLineByLine();
+    });
   } catch (error) {
-    if (error.code === 'ENOENT') {
-      console.log(`[client][${PID}] File ${eventsFile} not found.`);
-    } else {
-      console.error(`[client][${PID}] Error processing events:`, error.message);
-    }
+    console.error(`[client][${PID}] Error watching file:`, error.message);
+    setTimeout(start, 1000);
   }
 };
 
 const start = () => {
-  const checkFileAndStartWatching = () => {
-    fs.access(eventsFile, fs.constants.F_OK, (err) => {
-      if (!err) {
-        console.log(`[client][${PID}] File found. Starting processing and watching...`);
-        processEventsLineByLine(); // Process events line by line
-        watchFile();
-      } else {
-        console.log(`[client][${PID}] File ${eventsFile} not found. Checking again in 1 second...`);
-        setTimeout(checkFileAndStartWatching, 1000);
-      }
-    });
-  };
-
-  checkFileAndStartWatching();
-};
-
-const watchFile = () => {
-  let watcher;
-  if (watcher) {
-    watcher.close();
-  }
-
-  let changeEventReceivedInLast500ms = false;
-  try {
-    watcher = fs.watch(eventsFile, (eventType, filename) => {
-      if (filename) {
-        console.log(`[client][${PID}] File ${filename} event type: ${eventType}`);
-        if (eventType === 'rename') { // 'rename' event also occurs on delete
-          console.log(`[client][${PID}] ${eventsFile} was renamed (or deleted). Restarting watch process...`);
-
-          // Start watching again, after a delay, to avoid rapid loops
-          setTimeout(start, 1000);
-
-        } else if (!changeEventReceivedInLast500ms && eventType === 'change') {
-          changeEventReceivedInLast500ms = true;
-          console.log(`[client][${PID}] ${eventsFile} changed. Reprocessing events...`);
-          processEventsLineByLine(); // Reprocess events line by line
-          setTimeout(() => changeEventReceivedInLast500ms = false, 500);
-        }
-      } else {
-        // Filename is null, which can also indicate file deletion on some systems
-        console.log(`[client][${PID}] ${eventsFile} was possibly deleted. Restarting watch process...`);
-
-        // Start watching again, after a delay, to avoid rapid loops
-        setTimeout(start, 1000);
-      }
-    });
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      console.log(`[client][${PID}] File ${eventsFile} not found. Restarting watch process...`);
-      setTimeout(start, 1000);
+  fs.access(config.eventsFile, fs.constants.F_OK, (err) => {
+    if (!err) {
+      console.log(`[client][${PID}] File found. Processing and watching...`);
+      processEventsLineByLine();
+      watchFile();
     } else {
-      console.error(`[client][${PID}] Error watching file:`, error);
+      console.log(`[client][${PID}] File ${config.eventsFile} not found. Checking again in 1 second...`);
+      setTimeout(start, 1000);
     }
-  }
+  });
 };
 
 start();
